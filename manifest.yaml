@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@keeb/docker"
 version: "2026.02.27.1"
-description: "Docker Engine + Compose lifecycle over SSH"
+description: "Docker Engine + Compose lifecycle over SSH (https://github.com/keeb/swamp-docker)"
 models:
   - docker_engine.ts
   - docker_compose.ts
