@@ -1,0 +1,11 @@
+manifestVersion: 1
+name: "@keeb/docker"
+version: "2026.02.27.1"
+description: "Docker Engine + Compose lifecycle over SSH"
+models:
+  - docker_engine.ts
+  - docker_compose.ts
+workflows:
+  - setup-docker/workflow.yaml
+dependencies:
+  - "@keeb/ssh"
