@@ -1,9 +1,9 @@
 manifestVersion: 1
 name: "@keeb/docker"
-version: "2026.03.02.2"
+version: "2026.03.02.3"
 description: "Docker Engine + Compose lifecycle over SSH (https://github.com/keeb/swamp-docker)"
 repository: https://github.com/keeb/swamp-docker
-tags:
+labels:
   - docker
   - containers
   - infrastructure
