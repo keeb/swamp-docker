@@ -1,5 +1,5 @@
 id: c0240ea9-32d5-424e-b6cf-abfec07c5579
-name: setup-docker
+name: '@keeb/setup-docker'
 description: Install Docker Engine on a running VM by name
 inputs:
   vmName:

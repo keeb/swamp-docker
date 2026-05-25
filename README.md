@@ -12,8 +12,8 @@ Install Docker Engine and manage containers on a remote host.
 |--------|-------------|
 | `install` | Install Docker Engine on Alpine Linux |
 | `build` | Build a Docker image from a Dockerfile |
-| `run` | Run a container |
-| `stop` | Stop a container |
+| `run` | Run a container (stops existing container with same name first) |
+| `stop` | Stop and remove a container (idempotent) |
 | `inspect` | Inspect a container |
 | `exec` | Execute a command in a running container |
 
@@ -36,7 +36,7 @@ Manage Docker Compose services on a remote host.
 
 ## Dependencies
 
-- [@keeb/ssh](https://github.com/keeb/swamp-ssh) — SSH helpers (`lib/ssh.ts`)
+- [@keeb/ssh](https://github.com/keeb/swamp-extensions) — SSH helpers (`lib/ssh.ts`)
 
 ## Install
 
@@ -44,6 +44,27 @@ Manage Docker Compose services on a remote host.
 swamp extension pull @keeb/docker
 ```
 
+## Usage
+
+Install Docker on a fresh Alpine VM, then run a container:
+
+```bash
+# Install docker + enable the service
+swamp model method run my-host install
+
+# Run nginx exposed on 8080
+swamp model method run my-host run \
+  --args containerName=web,imageTag=nginx:alpine,ports='["8080:80"]',restart=unless-stopped
+```
+
+Or manage a compose stack on the same host:
+
+```bash
+# Pull latest images and restart services in ~/stack
+swamp model method run my-stack update
+swamp model method run my-stack status
+```
+
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).

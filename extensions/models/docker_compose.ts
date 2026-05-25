@@ -1,11 +1,20 @@
+/**
+ * Model `@keeb/docker/compose` — manages Docker Compose service lifecycle
+ * (start, stop, update, status) on a remote host over SSH against a compose
+ * project directory.
+ */
 import { z } from "npm:zod@4";
 import { sshExec } from "./lib/ssh.ts";
 
 const GlobalArgs = z.object({
   sshHost: z.string().describe("SSH hostname or IP address"),
   sshUser: z.string().default("root").describe("SSH user (default 'root')"),
-  composePath: z.string().describe("Path to docker-compose directory on remote host"),
-  serviceName: z.string().optional().describe("Specific service name (optional, operates on all services if omitted)"),
+  composePath: z.string().describe(
+    "Path to docker-compose directory on remote host",
+  ),
+  serviceName: z.string().optional().describe(
+    "Specific service name (optional, operates on all services if omitted)",
+  ),
 });
 
 const ResultSchema = z.object({
@@ -19,8 +28,9 @@ function composeCmd(path, serviceName, action) {
   return `cd ${path} && docker compose ${action}${svc}`;
 }
 
+/** Docker Compose lifecycle model definition. */
 export const model = {
-  type: "@user/docker/compose",
+  type: "@keeb/docker/compose",
   version: "2026.02.11.1",
   resources: {
     "result": {
@@ -35,8 +45,9 @@ export const model = {
     start: {
       description: "Start Docker Compose services",
       arguments: z.object({}),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root", composePath, serviceName } = context.globalArgs;
+      execute: async (_args, context) => {
+        const { sshHost, sshUser = "root", composePath, serviceName } =
+          context.globalArgs;
         const cmd = composeCmd(composePath, serviceName, "up -d");
 
         console.log(`[start] Starting services at ${sshHost}:${composePath}`);
@@ -55,9 +66,11 @@ export const model = {
     stop: {
       description: "Stop Docker Compose services",
       arguments: z.object({}),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root", composePath, serviceName } = context.globalArgs;
-        const cmd = composeCmd(composePath, serviceName, "down") + " && sleep 3";
+      execute: async (_args, context) => {
+        const { sshHost, sshUser = "root", composePath, serviceName } =
+          context.globalArgs;
+        const cmd = composeCmd(composePath, serviceName, "down") +
+          " && sleep 3";
 
         console.log(`[stop] Stopping services at ${sshHost}:${composePath}`);
         const result = await sshExec(sshHost, sshUser, cmd);
@@ -75,10 +88,12 @@ export const model = {
     update: {
       description: "Pull latest images and restart Docker Compose services",
       arguments: z.object({}),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root", composePath, serviceName } = context.globalArgs;
+      execute: async (_args, context) => {
+        const { sshHost, sshUser = "root", composePath, serviceName } =
+          context.globalArgs;
         const svc = serviceName ? ` ${serviceName}` : "";
-        const cmd = `cd ${composePath} && docker compose pull${svc} && docker compose up -d${svc}`;
+        const cmd =
+          `cd ${composePath} && docker compose pull${svc} && docker compose up -d${svc}`;
 
         console.log(`[update] Updating services at ${sshHost}:${composePath}`);
         const result = await sshExec(sshHost, sshUser, cmd);
@@ -96,8 +111,9 @@ export const model = {
     status: {
       description: "Show Docker Compose service status",
       arguments: z.object({}),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root", composePath, serviceName } = context.globalArgs;
+      execute: async (_args, context) => {
+        const { sshHost, sshUser = "root", composePath, serviceName } =
+          context.globalArgs;
         const cmd = composeCmd(composePath, serviceName, "ps");
 
         console.log(`[status] Checking services at ${sshHost}:${composePath}`);
