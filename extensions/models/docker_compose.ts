@@ -15,6 +15,9 @@ const GlobalArgs = z.object({
   serviceName: z.string().optional().describe(
     "Specific service name (optional, operates on all services if omitted)",
   ),
+  pruneOnUpdate: z.boolean().default(false).describe(
+    "Run 'docker image prune -f' after a successful update to reclaim disk space",
+  ),
 });
 
 const ResultSchema = z.object({
@@ -31,7 +34,7 @@ function composeCmd(path, serviceName, action) {
 /** Docker Compose lifecycle model definition. */
 export const model = {
   type: "@keeb/docker/compose",
-  version: "2026.02.11.1",
+  version: "2026.05.31.1",
   resources: {
     "result": {
       description: "Docker compose operation result",
@@ -89,13 +92,25 @@ export const model = {
       description: "Pull latest images and restart Docker Compose services",
       arguments: z.object({}),
       execute: async (_args, context) => {
-        const { sshHost, sshUser = "root", composePath, serviceName } =
-          context.globalArgs;
+        const {
+          sshHost,
+          sshUser = "root",
+          composePath,
+          serviceName,
+          pruneOnUpdate,
+        } = context.globalArgs;
         const svc = serviceName ? ` ${serviceName}` : "";
+        // Chaining prune with && ensures it only runs on a successful update.
+        const prune = pruneOnUpdate ? ` && docker image prune -f` : "";
         const cmd =
-          `cd ${composePath} && docker compose pull${svc} && docker compose up -d${svc}`;
+          `cd ${composePath} && docker compose pull${svc} && docker compose up -d${svc}${prune}`;
 
         console.log(`[update] Updating services at ${sshHost}:${composePath}`);
+        if (pruneOnUpdate) {
+          console.log(
+            `[update] pruneOnUpdate enabled — will prune dangling images after update`,
+          );
+        }
         const result = await sshExec(sshHost, sshUser, cmd);
 
         console.log(`[update] Services updated successfully`);
@@ -123,6 +138,29 @@ export const model = {
         const handle = await context.writeResource("result", "result", {
           success: true,
           output: result.stdout,
+          timestamp: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    prune: {
+      description:
+        "Remove dangling Docker images on the remote host to reclaim disk space",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const { sshHost, sshUser = "root" } = context.globalArgs;
+        // Dangling-only (no -a): safe, never removes tagged images or running
+        // containers' images.
+        const cmd = "docker image prune -f";
+
+        console.log(`[prune] Pruning dangling images at ${sshHost}`);
+        const result = await sshExec(sshHost, sshUser, cmd);
+
+        console.log(`[prune] Prune complete`);
+        const handle = await context.writeResource("result", "result", {
+          success: true,
+          output: result.stdout || result.stderr,
           timestamp: new Date().toISOString(),
         });
         return { dataHandles: [handle] };
