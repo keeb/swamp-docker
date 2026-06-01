@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@keeb/docker"
-version: "2026.05.31.1"
+version: "2026.05.31.2"
 description: "Manage Docker Engine and Docker Compose lifecycle on remote hosts over SSH, including install, build, run, inspect, exec, and compose service operations."
 repository: https://github.com/keeb/swamp-docker
 labels:
