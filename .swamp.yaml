@@ -1,4 +1,6 @@
 swampVersion: 20260206.200442.0
-initializedAt: '2026-02-27T16:50:00.466Z'
+initializedAt: "2026-02-27T16:50:00.466Z"
 repoId: 9a67ba8f-c8c3-4c9d-8ba9-431340e13ddf
-tool: claude
+tools:
+  - claude
+upgradedAt: "2026-10-15T15:01:23.683Z"

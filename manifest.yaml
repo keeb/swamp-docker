@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@keeb/docker"
-version: "2026.05.31.2"
+version: "2026.10.15.1"
 description: "Manage Docker Engine and Docker Compose lifecycle on remote hosts over SSH, including install, build, run, inspect, exec, and compose service operations."
 repository: https://github.com/keeb/swamp-docker
 labels:
@@ -15,7 +15,7 @@ models:
   - docker_engine.ts
   - docker_compose.ts
 workflows:
-  - setup-docker/workflow.yaml
+  - workflow-c0240ea9-32d5-424e-b6cf-abfec07c5579.yaml
 skills:
   - docker
 dependencies:
