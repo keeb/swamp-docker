@@ -4,7 +4,12 @@
  * `build`, `run`, `stop`, `inspect`, and `exec` methods.
  */
 import { z } from "npm:zod@4";
-import { isValidSshHost, sshExec, sshExecRaw } from "./lib/ssh.ts";
+import { assertSshTarget, shellQuote, sshExec, sshExecRaw } from "./lib/ssh.ts";
+
+/** Docker's own container-name rule. */
+const CONTAINER_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/;
+/** Environment variable names accepted for the generated env file. */
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const GlobalArgs = z.object({
   sshHost: z.string().describe("SSH hostname/IP of the target VM"),
@@ -33,10 +38,142 @@ const ContainerSchema = z.object({
   timestamp: z.string(),
 });
 
+const ContainerName = z.string().regex(CONTAINER_NAME_RE).describe(
+  "Container name ([a-zA-Z0-9][a-zA-Z0-9_.-]+)",
+);
+
+/**
+ * Quote a remote path for `sh`, keeping a leading `~/` unquoted so the remote
+ * shell still expands it to the SSH user's home directory.
+ */
+export function remotePath(path: string): string {
+  if (path === "~") return "~";
+  if (path.startsWith("~/")) return `~/${shellQuote(path.slice(2))}`;
+  return shellQuote(path);
+}
+
+/**
+ * Normalise a `ports`/`volumes` argument: an array of strings, a JSON array
+ * string, or a single plain value. Throws a descriptive error otherwise.
+ */
+export function parseStringList(
+  value: string | string[] | undefined,
+  field: string,
+): string[] {
+  if (value === undefined || value === "") return [];
+  let list: unknown = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        list = JSON.parse(trimmed);
+      } catch (err) {
+        throw new Error(
+          `Invalid ${field}: not a valid JSON array (${
+            (err as Error).message
+          })`,
+        );
+      }
+    } else {
+      list = [trimmed];
+    }
+  }
+  if (!Array.isArray(list) || !list.every((v) => typeof v === "string")) {
+    throw new Error(`Invalid ${field}: expected an array of strings`);
+  }
+  return list as string[];
+}
+
+/** Parse the `env` argument (a JSON object string) into validated entries. */
+export function parseEnv(value: string | undefined): [string, string][] {
+  if (!value) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (err) {
+    throw new Error(
+      `Invalid env: not valid JSON (${(err as Error).message})`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Invalid env: expected a JSON object of NAME: value");
+  }
+  return Object.entries(parsed).map(([k, v]) => {
+    if (!ENV_KEY_RE.test(k)) {
+      throw new Error(`Invalid env: variable name '${k}' is not allowed`);
+    }
+    const s = typeof v === "string" ? v : JSON.stringify(v);
+    if (/[\r\n]/.test(s)) {
+      throw new Error(
+        `Invalid env: value for '${k}' contains a newline, which env files cannot hold`,
+      );
+    }
+    return [k, s];
+  });
+}
+
+/** Build the remote `docker run` command line; every value is shell-quoted. */
+export function buildRunCommand(opts: {
+  containerName: string;
+  imageTag: string;
+  restart?: string;
+  ports: string[];
+  volumes: string[];
+  envFilePath?: string;
+  command?: string;
+}): string {
+  const parts = [
+    "docker",
+    "run",
+    "-d",
+    "--name",
+    shellQuote(opts.containerName),
+  ];
+  if (opts.restart) parts.push("--restart", shellQuote(opts.restart));
+  for (const p of opts.ports) parts.push("-p", shellQuote(p));
+  for (const v of opts.volumes) parts.push("-v", shellQuote(v));
+  if (opts.envFilePath) parts.push("--env-file", remotePath(opts.envFilePath));
+  parts.push(shellQuote(opts.imageTag));
+  // `command` is intentionally passed through unquoted: it is a shell command
+  // line for the container (e.g. "sh -c 'echo hi'"), split by the remote shell.
+  if (opts.command) parts.push(opts.command);
+  return parts.join(" ");
+}
+
+/** Parse `docker inspect --format '{{.State.Running}} {{.Id}} {{.Config.Image}}'`. */
+export function parseInspectOutput(stdout: string): {
+  running: boolean;
+  containerId: string;
+  imageTag: string;
+} {
+  const parts = stdout.trim().split(/\s+/);
+  return {
+    running: parts[0] === "true",
+    containerId: parts[1] || "",
+    imageTag: parts[2] || "",
+  };
+}
+
+// deno-lint-ignore no-explicit-any
+type Ctx = any;
+
+function target(context: Ctx): { sshHost: string; sshUser: string } {
+  const { sshHost, sshUser = "root" } = context.globalArgs;
+  assertSshTarget(sshHost, sshUser);
+  return { sshHost, sshUser };
+}
+
 /** Docker Engine lifecycle model definition. */
 export const model = {
   type: "@keeb/docker/engine",
   version: "2026.02.11.2",
+  upgrades: [
+    {
+      toVersion: "2026.02.11.2",
+      description: "Version bump, no globalArguments schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     "result": {
       description: "Docker engine operation result",
@@ -58,21 +195,35 @@ export const model = {
     },
   },
   globalArguments: GlobalArgs,
+  checks: {
+    "valid-ssh-target": {
+      description:
+        "sshHost is a hostname or IP and sshUser a login name (neither can be read as an ssh option)",
+      labels: ["policy"],
+      execute: (context: Ctx) => {
+        try {
+          const { sshHost, sshUser = "root" } = context.globalArgs;
+          assertSshTarget(sshHost, sshUser);
+          return Promise.resolve({ pass: true });
+        } catch (err) {
+          return Promise.resolve({
+            pass: false,
+            errors: [(err as Error).message],
+          });
+        }
+      },
+    },
+  },
   methods: {
     install: {
       description: "Install Docker Engine on an Alpine VM via SSH",
       arguments: z.object({}),
-      execute: async (_args, context) => {
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
+      execute: async (_args: Record<string, never>, context: Ctx) => {
+        const { sshHost, sshUser } = target(context);
+        const logs: string[] = [];
+        const log = (msg: string) => logs.push(msg);
 
-        const logs = [];
-        const log = (msg) => logs.push(msg);
-
+        context.logger.info("Installing Docker on {host}", { host: sshHost });
         log(`Installing Docker on ${sshHost}`);
         const result = await sshExec(
           sshHost,
@@ -81,6 +232,9 @@ export const model = {
         );
         log(`Docker installed and started`);
         log(result.stdout || result.stderr);
+        context.logger.info("Docker installed and started on {host}", {
+          host: sshHost,
+        });
 
         const handle = await context.writeResource("result", "result", {
           success: true,
@@ -94,35 +248,47 @@ export const model = {
     build: {
       description: "Build a Docker image on the remote host",
       arguments: z.object({
-        imageTag: z.string().describe("Tag for the built image"),
-        contextPath: z.string().describe("Build context path on remote host"),
+        imageTag: z.string().min(1).describe("Tag for the built image"),
+        contextPath: z.string().min(1).describe(
+          "Build context path on remote host",
+        ),
         dockerfilePath: z.string().optional().describe(
           "Path to Dockerfile (relative to context)",
         ),
       }),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
-
+      execute: async (
+        args: {
+          imageTag: string;
+          contextPath: string;
+          dockerfilePath?: string;
+        },
+        context: Ctx,
+      ) => {
+        const { sshHost, sshUser } = target(context);
         const { imageTag, contextPath } = args;
-        const dfFlag = args.dockerfilePath ? ` -f ${args.dockerfilePath}` : "";
-        const logs = [];
-        const log = (msg) => logs.push(msg);
+        const dfFlag = args.dockerfilePath
+          ? ` -f ${remotePath(args.dockerfilePath)}`
+          : "";
+        const logs: string[] = [];
+        const log = (msg: string) => logs.push(msg);
 
+        context.logger.info("Building image {tag} on {host}", {
+          tag: imageTag,
+          host: sshHost,
+        });
         log(
           `Building image '${imageTag}' on ${sshHost} (context: ${contextPath})`,
         );
         const result = await sshExec(
           sshHost,
           sshUser,
-          `docker build -t ${imageTag}${dfFlag} ${contextPath}`,
+          `docker build -t ${shellQuote(imageTag)}${dfFlag} ${
+            remotePath(contextPath)
+          }`,
         );
         log(`Image '${imageTag}' built`);
         log((result.stdout || result.stderr).trim());
+        context.logger.info("Image {tag} built", { tag: imageTag });
 
         const handle = await context.writeResource("image", imageTag, {
           imageTag,
@@ -138,8 +304,8 @@ export const model = {
       description:
         "Run a Docker container (stops existing container with same name first)",
       arguments: z.object({
-        containerName: z.string().describe("Name for the container"),
-        imageTag: z.string().describe("Image to run"),
+        containerName: ContainerName,
+        imageTag: z.string().min(1).describe("Image to run"),
         ports: z.union([z.array(z.string()), z.string()]).optional().describe(
           "Port mappings (e.g. ['8080:8080'])",
         ),
@@ -156,71 +322,104 @@ export const model = {
           "Restart policy (e.g. 'unless-stopped')",
         ),
         command: z.string().optional().describe(
-          "Command to run in the container",
+          "Command to run in the container (passed to the remote shell as-is)",
         ),
       }),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
-
+      execute: async (
+        args: {
+          containerName: string;
+          imageTag: string;
+          ports?: string | string[];
+          volumes?: string | string[];
+          env?: string;
+          envFile?: string;
+          restart?: string;
+          command?: string;
+        },
+        context: Ctx,
+      ) => {
+        const { sshHost, sshUser } = target(context);
         const { containerName, imageTag } = args;
-        const parsedPorts = args.ports
-          ? (typeof args.ports === "string"
-            ? JSON.parse(args.ports)
-            : args.ports)
-          : [];
-        const parsedVolumes = args.volumes
-          ? (typeof args.volumes === "string"
-            ? JSON.parse(args.volumes)
-            : args.volumes)
-          : [];
-        const parsedEnv = args.env ? JSON.parse(args.env) : null;
-        const logs = [];
-        const log = (msg) => logs.push(msg);
+        if (!CONTAINER_NAME_RE.test(containerName)) {
+          throw new Error(`Invalid containerName '${containerName}'`);
+        }
+        // Validate every input before touching the remote host.
+        const ports = parseStringList(args.ports, "ports");
+        const volumes = parseStringList(args.volumes, "volumes");
+        const env = parseEnv(args.env);
+        const logs: string[] = [];
+        const log = (msg: string) => logs.push(msg);
+
+        context.logger.info("Running container {name} from {image} on {host}", {
+          name: containerName,
+          image: imageTag,
+          host: sshHost,
+        });
 
         // Stop and remove existing container (idempotent)
         log(`Stopping old container '${containerName}' if it exists`);
+        const q = shellQuote(containerName);
         await sshExecRaw(
           sshHost,
           sshUser,
-          `docker stop ${containerName} 2>/dev/null; docker rm ${containerName} 2>/dev/null; true`,
+          `docker stop ${q} 2>/dev/null; docker rm ${q} 2>/dev/null; true`,
         );
 
-        // Write .env file if env record provided
+        // Write a private, temporary env file when an env record is provided.
         let envFilePath = args.envFile;
-        if (parsedEnv && !envFilePath) {
-          envFilePath = `/tmp/${containerName}.env`;
-          const envLines = Object.entries(parsedEnv).map(([k, v]) =>
-            `${k}=${v}`
-          ).join("\\n");
-          log(`Writing env file to ${envFilePath}`);
-          await sshExec(
-            sshHost,
-            sshUser,
-            `printf '${envLines}\\n' > ${envFilePath}`,
-          );
+        let tempEnvFile: string | undefined;
+        if (env.length > 0 && envFilePath) {
+          log(`Both env and envFile given; using envFile ${envFilePath}`);
+        } else if (env.length > 0) {
+          tempEnvFile = `/tmp/${containerName}.env`;
+          envFilePath = tempEnvFile;
         }
 
-        // Build docker run command
-        const runArgs = ["docker", "run", "-d", "--name", containerName];
-        if (args.restart) runArgs.push("--restart", args.restart);
-        for (const p of parsedPorts) runArgs.push("-p", p);
-        for (const v of parsedVolumes) runArgs.push("-v", v);
-        if (envFilePath) runArgs.push("--env-file", envFilePath);
-        runArgs.push(imageTag);
-        if (args.command) runArgs.push(args.command);
+        const runCmd = buildRunCommand({
+          containerName,
+          imageTag,
+          restart: args.restart,
+          ports,
+          volumes,
+          envFilePath,
+          command: args.command,
+        });
 
-        log(`Starting container '${containerName}' with image '${imageTag}'`);
-        log(`Command: ${runArgs.join(" ")}`);
-        const result = await sshExec(sshHost, sshUser, runArgs.join(" "));
+        let result;
+        try {
+          if (tempEnvFile) {
+            log(`Writing env file to ${tempEnvFile}`);
+            // Values travel on stdin, never in an argument list.
+            const f = shellQuote(tempEnvFile);
+            await sshExec(
+              sshHost,
+              sshUser,
+              `(umask 077 && rm -f ${f} && cat > ${f})`,
+              { stdin: env.map(([k, v]) => `${k}=${v}\n`).join("") },
+            );
+          }
+          log(`Starting container '${containerName}' with image '${imageTag}'`);
+          log(`Command: ${runCmd}`);
+          result = await sshExec(sshHost, sshUser, runCmd);
+        } finally {
+          // docker copies the env into the container config at create time,
+          // so the temporary file (which may hold secrets) is not needed.
+          if (tempEnvFile) {
+            await sshExecRaw(
+              sshHost,
+              sshUser,
+              `rm -f ${shellQuote(tempEnvFile)}`,
+            );
+          }
+        }
         const containerId = result.stdout.trim();
         log(
           `Container '${containerName}' running (${containerId.slice(0, 12)})`,
         );
+        context.logger.info("Container {name} running ({id})", {
+          name: containerName,
+          id: containerId.slice(0, 12),
+        });
 
         const handle = await context.writeResource("container", containerName, {
           containerName,
@@ -237,31 +436,43 @@ export const model = {
     stop: {
       description: "Stop and remove a Docker container (idempotent)",
       arguments: z.object({
-        containerName: z.string().describe("Name of the container to stop"),
+        containerName: ContainerName,
       }),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
-
+      execute: async (args: { containerName: string }, context: Ctx) => {
+        const { sshHost, sshUser } = target(context);
         const { containerName } = args;
-        const logs = [];
-        const log = (msg) => logs.push(msg);
+        if (!CONTAINER_NAME_RE.test(containerName)) {
+          throw new Error(`Invalid containerName '${containerName}'`);
+        }
+        const logs: string[] = [];
+        const log = (msg: string) => logs.push(msg);
+        const q = shellQuote(containerName);
 
+        context.logger.info("Stopping container {name} on {host}", {
+          name: containerName,
+          host: sshHost,
+        });
         log(`Stopping container '${containerName}' on ${sshHost}`);
+        // Record the image before removal so the stored state stays truthful.
+        const before = await sshExecRaw(
+          sshHost,
+          sshUser,
+          `docker container inspect --format '{{.Config.Image}}' ${q} 2>/dev/null`,
+        );
+        const imageTag = before.code === 0 ? before.stdout.trim() : "";
         await sshExecRaw(
           sshHost,
           sshUser,
-          `docker stop ${containerName} 2>/dev/null; docker rm ${containerName} 2>/dev/null; true`,
+          `docker stop ${q} 2>/dev/null; docker rm ${q} 2>/dev/null; true`,
         );
         log(`Container '${containerName}' stopped`);
+        context.logger.info("Container {name} stopped", {
+          name: containerName,
+        });
 
         const handle = await context.writeResource("container", containerName, {
           containerName,
-          imageTag: "",
+          imageTag,
           running: false,
           logs: logs.join("\n"),
           timestamp: new Date().toISOString(),
@@ -273,29 +484,35 @@ export const model = {
     inspect: {
       description: "Inspect a Docker container",
       arguments: z.object({
-        containerName: z.string().describe("Name of the container to inspect"),
+        containerName: ContainerName,
       }),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
-
+      execute: async (args: { containerName: string }, context: Ctx) => {
+        const { sshHost, sshUser } = target(context);
         const { containerName } = args;
-        const logs = [];
-        const log = (msg) => logs.push(msg);
+        if (!CONTAINER_NAME_RE.test(containerName)) {
+          throw new Error(`Invalid containerName '${containerName}'`);
+        }
+        const logs: string[] = [];
+        const log = (msg: string) => logs.push(msg);
 
+        context.logger.info("Inspecting container {name} on {host}", {
+          name: containerName,
+          host: sshHost,
+        });
         log(`Inspecting container '${containerName}' on ${sshHost}`);
         const result = await sshExecRaw(
           sshHost,
           sshUser,
-          `docker inspect --format '{{.State.Running}} {{.Id}} {{.Config.Image}}' ${containerName} 2>/dev/null`,
+          `docker container inspect --format '{{.State.Running}} {{.Id}} {{.Config.Image}}' ${
+            shellQuote(containerName)
+          } 2>/dev/null`,
         );
 
         if (result.code !== 0) {
           log(`Container '${containerName}' not found`);
+          context.logger.info("Container {name} not found", {
+            name: containerName,
+          });
           const handle = await context.writeResource(
             "container",
             containerName,
@@ -310,15 +527,18 @@ export const model = {
           return { dataHandles: [handle] };
         }
 
-        const parts = result.stdout.trim().split(" ");
-        const running = parts[0] === "true";
-        const containerId = parts[1] || "";
-        const imageTag = parts[2] || "";
+        const { running, containerId, imageTag } = parseInspectOutput(
+          result.stdout,
+        );
         log(
           `Container '${containerName}': running=${running}, id=${
             containerId.slice(0, 12)
           }, image=${imageTag}`,
         );
+        context.logger.info("Container {name} running={running}", {
+          name: containerName,
+          running,
+        });
 
         const handle = await context.writeResource("container", containerName, {
           containerName,
@@ -335,33 +555,42 @@ export const model = {
     exec: {
       description: "Execute a command inside a running Docker container",
       arguments: z.object({
-        containerName: z.string().describe("Name of the container"),
-        command: z.string().describe("Command to execute"),
+        containerName: ContainerName,
+        command: z.string().min(1).describe(
+          "Command to execute (passed to the remote shell as-is)",
+        ),
         workdir: z.string().optional().describe(
           "Working directory inside the container",
         ),
       }),
-      execute: async (args, context) => {
-        const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) {
-          throw new Error(
-            "sshHost is required — VM must be running with an IP",
-          );
-        }
-
+      execute: async (
+        args: { containerName: string; command: string; workdir?: string },
+        context: Ctx,
+      ) => {
+        const { sshHost, sshUser } = target(context);
         const { containerName, command } = args;
-        const wdFlag = args.workdir ? ` -w ${args.workdir}` : "";
-        const logs = [];
-        const log = (msg) => logs.push(msg);
+        if (!CONTAINER_NAME_RE.test(containerName)) {
+          throw new Error(`Invalid containerName '${containerName}'`);
+        }
+        const wdFlag = args.workdir ? ` -w ${shellQuote(args.workdir)}` : "";
+        const logs: string[] = [];
+        const log = (msg: string) => logs.push(msg);
 
+        context.logger.info("Running command in {name} on {host}", {
+          name: containerName,
+          host: sshHost,
+        });
         log(`Running command in '${containerName}' on ${sshHost}: ${command}`);
         const result = await sshExec(
           sshHost,
           sshUser,
-          `docker exec${wdFlag} ${containerName} ${command}`,
+          `docker exec${wdFlag} ${shellQuote(containerName)} ${command}`,
         );
         log(`Command completed`);
         log((result.stdout || result.stderr).trim());
+        context.logger.info("Command completed in {name}", {
+          name: containerName,
+        });
 
         const handle = await context.writeResource("result", "result", {
           success: true,

@@ -14,8 +14,10 @@ import "npm:@traversable/registry@0.0.49";
 import { zxTest } from "npm:@traversable/zod-test@0.0.28";
 import { assert } from "jsr:@std/assert@1";
 
-// deno-lint-ignore no-explicit-any
-type AnySchema = { safeParse: (v: unknown) => { success: boolean; error?: any } };
+type AnySchema = {
+  // deno-lint-ignore no-explicit-any
+  safeParse: (v: unknown) => { success: boolean; error?: any };
+};
 
 function isZodSchema(v: unknown): v is AnySchema {
   return typeof v === "object" && v !== null && "_zod" in v &&
@@ -45,7 +47,10 @@ function collectSchemas(model: any): [label: string, schema: AnySchema][] {
 const modelsDir = new URL("../../extensions/models/", import.meta.url);
 const modelFiles: string[] = [];
 for await (const entry of Deno.readDir(modelsDir)) {
-  if (entry.isFile && entry.name.endsWith(".ts")) modelFiles.push(entry.name);
+  if (
+    entry.isFile && entry.name.endsWith(".ts") &&
+    !entry.name.endsWith("_test.ts")
+  ) modelFiles.push(entry.name);
 }
 modelFiles.sort();
 

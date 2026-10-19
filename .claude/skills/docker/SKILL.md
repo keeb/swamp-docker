@@ -68,6 +68,10 @@ arguments — behavior is driven entirely by global arguments.
   - `update` — `docker compose pull` then `docker compose up -d` (scoped by
     `serviceName` if set)
   - `status` — `docker compose ps [<serviceName>]`
+  - `prune` — `docker image prune -f` (dangling images only)
+- **Other global arguments**: `pruneOnUpdate` (default `false`),
+  `rollbackOnUpdate` (default `false`), `updateHealthTimeout` (seconds, default
+  `30`).
 
 ## Dependencies
 
@@ -114,8 +118,9 @@ swamp model exec dockerEngine run \
   --restart unless-stopped
 ```
 
-`ports`, `volumes`, and `env` accept either arrays/objects or JSON-encoded
-strings — the model `JSON.parse`s strings at runtime.
+`ports` and `volumes` accept an array, a JSON array string, or a single plain
+value; `env` is a JSON object string. All are validated before the old
+container is stopped.
 
 ### Referencing results via CEL
 
@@ -153,12 +158,23 @@ chaining auth + lookup + install.
 - **`run` is destructive.** It unconditionally `docker stop && docker rm`s any
   existing container with the same name before starting. Safe for redeploys,
   surprising if you forgot.
-- **`stop` writes an empty `imageTag`.** The resulting `container` resource has
-  `imageTag: ""` — don't read it back expecting the old image.
-- **`env` must be a JSON _object string_, not `KEY=VALUE` lines.** The model
-  parses it with `JSON.parse` and writes `/tmp/<containerName>.env`. If you
-  already have an env file on the remote host, pass `envFile` instead and `env`
-  will be ignored.
+- **`stop` records the image it removed.** It reads `.Config.Image` before
+  removal; `imageTag` is `""` only when the container did not exist.
+- **`env` must be a JSON _object string_, not `KEY=VALUE` lines.** Names must be
+  `[A-Za-z_][A-Za-z0-9_]*` and values cannot contain newlines. The model streams the values over
+  stdin into `/tmp/<containerName>.env` (`umask 077`) and deletes it after
+  `docker run`.
+  If you already have an env file on the remote host, pass `envFile` instead
+  and `env` will be ignored.
+- **Values are shell-quoted; `command` is not.** Names, tags, paths, ports,
+  volumes and service names are single-quoted for the remote shell, and
+  `containerName` / `serviceName` must match Docker's naming rules. The
+  `command` of `run`/`exec` is passed through as a shell command line. A
+  leading `~/` in `composePath`/`contextPath` still expands.
+- **`update` rollback.** With `rollbackOnUpdate: true`, `update` captures the
+  running images, pulls, brings services up, waits up to `updateHealthTimeout`
+  seconds for them to be running/healthy, and on failure re-tags the old
+  images and runs `up -d` again before throwing.
 - **Idempotent is not graceful.** `docker stop` is not given a `-t` flag;
   containers that ignore SIGTERM will get SIGKILL after Docker's default 10s.
 - **SSH credentials are implicit.** There is no vault integration — auth is
